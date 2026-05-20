@@ -1,155 +1,144 @@
-import numpy as np
+"""Transformer encoders for CLIP-style PPG/GSR representation learning."""
+
+from __future__ import annotations
+
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
 
-class ppgEncoder(nn.Module):  # CLIP style encoder for PPG signals
-    def __init__(self, in_channels=1, emb_dim=128):
+from config import ModelConfig
+
+
+class SignalTransformerEncoder(nn.Module):
+    """Transformer encoder for one-dimensional physiological signals.
+
+    Input shape can be either [batch, length] or [batch, length, channels].
+    The output is an L2-normalized embedding with shape [batch, embed_dim].
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        embed_dim: int = 128,
+        transformer_dim: int = 128,
+        patch_size: int = 10,
+        depth: int = 4,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-    
-        self.feature_extractor = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
+        if patch_size <= 0:
+            raise ValueError("patch_size must be positive")
 
-            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-
-            nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv1d(
+            in_channels=input_channels,
+            out_channels=transformer_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
         )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, transformer_dim))
+        self.pos_dropout = nn.Dropout(dropout)
 
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.projection = nn.Linear(128, emb_dim)
-
-    def forward(self, x):
-        x = self.feature_extractor(x)
-        x = self.pool(x).squeeze(-1)  # (B, 128)
-        x = self.projection(x)        # (B, emb_dim)
-        x = F.normalize(x, dim=-1)    # L2 normalize
-        return x
-    
-class gsrEncoder(nn.Module):  # CLIP style encoder for GSR signals
-    def __init__(self, in_channels=1, emb_dim=128):
-        super().__init__()
-    
-        self.feature_extractor = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-
-            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-
-            nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=num_heads,
+            dim_feedforward=int(transformer_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(transformer_dim)
+        self.projection = nn.Linear(transformer_dim, embed_dim)
+        self._init_weights()
 
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.projection = nn.Linear(128, emb_dim)
-
-    def forward(self, x):
-        x = self.feature_extractor(x)
-        x = self.pool(x).squeeze(-1)  # (B, 128)
-        x = self.projection(x)        # (B, emb_dim)
-        x = F.normalize(x, dim=-1)    # L2 normalize
-        return x
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-    def forward(self, x):
-        return self.attn(x, x, x)[0]
-
-
-class ppgTransformerEncoder(nn.Module): # ViT style Transformer encoder for PPG signals
-    def __init__(self, embed_dim=128, num_heads=8, mlp_dim=256):
-        super().__init__()
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.randn(1, 400 + 1, embed_dim))  
-        self.attn = MultiHeadAttention(embed_dim, num_heads)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim), 
-            nn.ReLU(),
-            nn.Linear(mlp_dim, embed_dim)
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+    def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-    
-    def forward(self, x):
-        batch_size = x.size(0)
-        cls_t = self.cls_token.expand(batch_size, -1, -1)  # (B, 1, D)
-        x = torch.cat([cls_t, x], dim=1)  
-        x = x + self.pos_embed
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        cls_output = x[:, 0, :]  # (B, D)
-        cls_output = F.normalize(cls_output, dim=-1) 
-        return cls_output
-    
+        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
 
-class gsrTransformerEncoder(nn.Module): # ViT style Transformer encoder for GSR signals
-    def __init__(self, embed_dim=128, num_heads=8, mlp_dim=256):
+    @staticmethod
+    def _sinusoidal_positional_encoding(length: int, dim: int, device: torch.device) -> torch.Tensor:
+        position = torch.arange(length, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(length, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        return pe.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(-1)
+        if x.ndim != 3:
+            raise ValueError("Input must have shape [batch, length] or [batch, length, channels]")
+
+        # Conv1d expects [batch, channels, length].
+        x = x.transpose(1, 2)
+        x = self.patch_embed(x)
+        x = x.transpose(1, 2)
+
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self._sinusoidal_positional_encoding(x.size(1), x.size(2), x.device)
+        x = self.pos_dropout(x)
+
+        x = self.encoder(x)
+        cls_out = self.norm(x[:, 0])
+        z = self.projection(cls_out)
+        return F.normalize(z, dim=-1)
+
+
+class PPGGSRCLIP(nn.Module):
+    """Two-tower CLIP-style model with one PPG encoder and one GSR encoder."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.randn(1, 400 + 1, embed_dim))  
-        self.attn = MultiHeadAttention(embed_dim, num_heads)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim), 
-            nn.ReLU(),
-            nn.Linear(mlp_dim, embed_dim)
+        encoder_kwargs = dict(
+            input_channels=cfg.input_channels,
+            embed_dim=cfg.embed_dim,
+            transformer_dim=cfg.transformer_dim,
+            patch_size=cfg.patch_size,
+            depth=cfg.depth,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            dropout=cfg.dropout,
         )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-    
-    def forward(self, x):
-        batch_size = x.size(0)
-        cls_t = self.cls_token.expand(batch_size, -1, -1)  # (B, 1, D)
-        x = torch.cat([cls_t, x], dim=1)  
-        x = x + self.pos_embed
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        cls_output = x[:, 0, :]  # (B, D)
-        cls_output = F.normalize(cls_output, dim=-1) 
-        return cls_output
-    
+        self.ppg_encoder = SignalTransformerEncoder(**encoder_kwargs)
+        self.gsr_encoder = SignalTransformerEncoder(**encoder_kwargs)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / cfg.temperature)))
 
-class fusionModule(nn.Module):
-    def __init__(self, emb_dim=128):
-        super().__init__()
-        self.fc1 = nn.Linear(emb_dim * 2, emb_dim)
-        self.fc2 = nn.Linear(emb_dim, emb_dim)
-        self.GELU = nn.GELU()
+    def encode_ppg(self, ppg: torch.Tensor) -> torch.Tensor:
+        return self.ppg_encoder(ppg)
 
-    def forward(self, z1, z2):
-        # z1, z2: (B, emb_dim)
-        combined = torch.cat([z1, z2], dim=-1)  # (B, emb_dim*2)
-        fused = self.fc1(combined)                # (B, emb_dim)
-        fused = self.GELU(fused)
-        fused = self.fc2(fused)                  # (B, emb_dim)
-        return fused
-    
+    def encode_gsr(self, gsr: torch.Tensor) -> torch.Tensor:
+        return self.gsr_encoder(gsr)
 
-class emotionClassifier(nn.Module):
-    def __init__(self, emb_dim=128, num_classes=5):
-        super().__init__()
-        self.fc = nn.Linear(emb_dim, num_classes)
-
-    def forward(self, z):
-        # z: (B, emb_dim)
-        return self.fc(z)  # (B, num_classes)
-    
+    def forward(self, ppg: torch.Tensor, gsr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ppg_z = self.encode_ppg(ppg)
+        gsr_z = self.encode_gsr(gsr)
+        logit_scale = self.logit_scale.exp().clamp(max=100.0)
+        logits = logit_scale * ppg_z @ gsr_z.t()
+        return logits, ppg_z, gsr_z
 
 
+def clip_contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
+    """Symmetric InfoNCE loss for matched PPG/GSR batches."""
+
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss_ppg_to_gsr = F.cross_entropy(logits, labels)
+    loss_gsr_to_ppg = F.cross_entropy(logits.t(), labels)
+    return (loss_ppg_to_gsr + loss_gsr_to_ppg) / 2.0
+
+
+def retrieval_accuracy(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-1 retrieval accuracy in both directions for a batch."""
+
+    labels = torch.arange(logits.size(0), device=logits.device)
+    ppg_to_gsr = (logits.argmax(dim=1) == labels).float().mean()
+    gsr_to_ppg = (logits.argmax(dim=0) == labels).float().mean()
+    return ppg_to_gsr, gsr_to_ppg
